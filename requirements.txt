@@ -1,0 +1,4 @@
+PyQt6>=6.6
+pywayland>=0.4.17
+dasbus>=1.7
+PyInstaller>=6.0

@@ -22,27 +22,17 @@ returns the strategy that was actually applied so the caller can log it.
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import logging
 import os
 import shutil
 import textwrap
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 # Window class string we set on the overlay so KWin can find it.
 OVERLAY_WINDOW_CLASS = "flarereminder-overlay"
-
-# Names of the layer-shell-qt shared library across distros.
-LAYER_SHELL_QT_LIB_CANDIDATES = (
-    "liblayershellqtinterface.so.6",
-    "liblayershellqtinterface.so.5",
-    "liblayershellqtinterface.so",
-    "libLayerShellQtInterface.so.6",
-    "libLayerShellQtInterface.so",
-)
 
 # zwlr_layer_shell_v1 layer enum values.
 LAYER_BACKGROUND = 0
@@ -63,20 +53,72 @@ KBD_EXCLUSIVE = 1
 KBD_ON_DEMAND = 2
 
 
+# Common system locations for Qt 6 wayland-shell-integration plugins.
+# These are the paths Arch's layer-shell-qt package installs to.
+_SYSTEM_QT_PLUGIN_DIRS = (
+    "/usr/lib/qt6/plugins",
+    "/usr/lib64/qt6/plugins",
+    "/usr/lib/x86_64-linux-gnu/qt6/plugins",
+)
+
+# The filename Qt looks for when QT_WAYLAND_SHELL_INTEGRATION=layer-shell.
+_LAYER_SHELL_PLUGIN_BASENAMES = (
+    "libqwayland-layer-shell-integration.so",
+    "libqwayland-layer-shell.so",
+)
+
+
+def _find_system_layer_shell_plugin() -> str | None:
+    """Return the directory of the system layer-shell Qt plugin, or None."""
+    for base in _SYSTEM_QT_PLUGIN_DIRS:
+        wsi = Path(base) / "wayland-shell-integration"
+        if not wsi.is_dir():
+            continue
+        for candidate in _LAYER_SHELL_PLUGIN_BASENAMES:
+            if (wsi / candidate).is_file():
+                return str(base)
+    return None
+
+
 def maybe_enable_layer_shell_integration() -> bool:
     """Hint Qt to use the layer-shell-qt QPA plugin, if available.
 
-    Must be called BEFORE constructing ``QApplication``. Returns True if
-    the env var was set.
+    Must be called BEFORE constructing ``QApplication``. Returns True iff
+    the env var was set and Qt should actually be able to load the plugin.
+
+    Handles both the "run from source" case (system PyQt6 picks up the
+    system plugin via the system plugin path) and the "frozen binary"
+    case (we must append the system plugin path to ``QT_PLUGIN_PATH`` so
+    Qt finds the layer-shell plugin alongside the bundled plugins).
     """
     if os.environ.get("QT_WAYLAND_SHELL_INTEGRATION"):
+        log.debug("QT_WAYLAND_SHELL_INTEGRATION already set; honoring it")
         return True  # respect user override
-    if _find_layer_shell_lib() is not None:
-        os.environ["QT_WAYLAND_SHELL_INTEGRATION"] = "layer-shell"
-        log.info("Enabled QT_WAYLAND_SHELL_INTEGRATION=layer-shell")
-        return True
-    log.debug("layer-shell-qt not found; running with default Qt Wayland integration")
-    return False
+
+    system_plugin_dir = _find_system_layer_shell_plugin()
+    if system_plugin_dir is None:
+        log.debug(
+            "System layer-shell-qt plugin not found; running with default "
+            "Qt Wayland integration. Install the `layer-shell-qt` package "
+            "to get fullscreen-game stacking."
+        )
+        return False
+
+    # Append the system Qt plugin path so Qt can actually load the
+    # layer-shell plugin when we're a PyInstaller frozen binary.
+    existing = os.environ.get("QT_PLUGIN_PATH", "")
+    if system_plugin_dir not in existing.split(os.pathsep):
+        os.environ["QT_PLUGIN_PATH"] = (
+            system_plugin_dir + (os.pathsep + existing if existing else "")
+        )
+        log.info("Prepended %s to QT_PLUGIN_PATH", system_plugin_dir)
+
+    os.environ["QT_WAYLAND_SHELL_INTEGRATION"] = "layer-shell"
+    log.info(
+        "Enabled QT_WAYLAND_SHELL_INTEGRATION=layer-shell (system plugin at %s)",
+        system_plugin_dir,
+    )
+    return True
 
 
 def apply_overlay_layer(qwindow: Any) -> str:
@@ -115,41 +157,26 @@ def apply_overlay_layer(qwindow: Any) -> str:
 # ---- LayerShellQt -------------------------------------------------------
 
 
-def _find_layer_shell_lib() -> str | None:
-    for name in LAYER_SHELL_QT_LIB_CANDIDATES:
-        full = ctypes.util.find_library(name) or name
-        # find_library may return just the soname; CDLL handles that.
-        try:
-            lib = ctypes.CDLL(full)
-            log.debug("Found LayerShellQt library: %s", full)
-            del lib
-            return full
-        except OSError:
-            continue
-    return None
-
-
 def _try_layer_shell_qt(qwindow: Any) -> bool:
-    """Best-effort attempt to call LayerShellQt::Window::get/setLayer.
+    """Best-effort attempt to mark ``qwindow`` as a layer-shell overlay.
 
-    LayerShellQt's API is C++ with mangled symbols, so this is fragile.
-    We probe for the most common Itanium-mangled symbol names exported
-    by ``liblayershellqtinterface.so.6``. If anything fails we return
-    False and the caller falls back to KWin scripting.
+    The layer-shell-qt QPA plugin is loaded at QApplication construction
+    time by Qt itself (triggered by ``QT_WAYLAND_SHELL_INTEGRATION=layer-shell``
+    plus a reachable plugin file). Once loaded it reads the following
+    QSurface properties at surface-creation time:
+
+        layershell.layer                 -> 0..3 (Overlay = 3)
+        layershell.anchors               -> edge bitmask
+        layershell.exclusiveZone         -> int32 (-1 = ignore)
+        layershell.keyboardInteractivity -> 0..2 (None = 0)
+        layershell.scope                 -> string namespace
+
+    So this function just sets those properties. Whether Qt *actually*
+    produced a layer-shell surface depends on whether the QPA plugin was
+    loaded — we treat that as "armed" if the env var is set.
     """
-    libname = _find_layer_shell_lib()
-    if libname is None:
+    if os.environ.get("QT_WAYLAND_SHELL_INTEGRATION") != "layer-shell":
         return False
-    try:
-        lib = ctypes.CDLL(libname)
-    except OSError:
-        return False
-
-    # Use Qt's `winId()` -> WId is just an opaque integer here. Without
-    # the proper LayerShellQtInterface API exported in C, we can only
-    # set the QSurface property hints that the layer-shell-qt QPA looks
-    # for. Those are: layershell.layer, layershell.anchors,
-    # layershell.exclusiveZone, layershell.keyboardInteractivity.
     try:
         qwindow.setProperty("layershell.layer", LAYER_OVERLAY)
         qwindow.setProperty("layershell.anchors", ANCHOR_ALL)
@@ -159,18 +186,7 @@ def _try_layer_shell_qt(qwindow: Any) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.debug("Could not set layershell.* QSurface properties: %s", exc)
         return False
-
-    # If layer-shell-qt's QPA plugin is loaded the properties above are
-    # honored at surface-creation time, so the strategy is "armed" even
-    # without a direct C function call. Treat this as success only if
-    # the env var indicates the plugin is engaged.
-    if os.environ.get("QT_WAYLAND_SHELL_INTEGRATION") == "layer-shell":
-        return True
-    log.debug(
-        "LayerShellQt lib found but QT_WAYLAND_SHELL_INTEGRATION!=layer-shell; "
-        "skipping"
-    )
-    return False
+    return True
 
 
 # ---- KWin scripting fallback --------------------------------------------
@@ -204,40 +220,60 @@ _KWIN_SCRIPT_TEMPLATE = textwrap.dedent(
 
 
 def _try_kwin_keep_above_script() -> bool:
-    """Install a one-shot KWin script via D-Bus.
+    """Install a one-shot KWin script via D-Bus (jeepney).
 
     Returns True if the script was loaded successfully.
     """
-    try:
-        from dasbus.connection import SessionMessageBus
-    except ImportError:
-        log.debug("dasbus not importable; cannot install KWin script")
-        return False
+    from .dbus_util import DBusError, call, open_bus
 
     script_path = _write_kwin_script()
     if script_path is None:
         return False
 
+    conn = open_bus("SESSION")
+    if conn is None:
+        return False
+
+    service = "org.kde.KWin"
+    scripting_path = "/Scripting"
+    scripting_iface = "org.kde.kwin.Scripting"
+
     try:
-        bus = SessionMessageBus()
-        proxy = bus.get_proxy("org.kde.KWin", "/Scripting")
-        # loadScript(QString filePath, QString pluginName) -> int
-        script_id = proxy.loadScript(str(script_path), "flarereminder-overlay")
-        # Run / start: KWin 5/6 differ. Try both.
-        try:
-            sub_proxy = bus.get_proxy(
-                "org.kde.KWin", f"/Scripting/Script{script_id}"
-            )
-            sub_proxy.run()
-        except Exception:  # noqa: BLE001
+        # loadScript(filePath, pluginName) -> int scriptId
+        body = call(
+            conn, service, scripting_path, scripting_iface,
+            "loadScript", "ss", (str(script_path), "flarereminder-overlay"),
+        )
+        if not body:
+            log.debug("KWin loadScript returned no body")
+            return False
+        script_id = int(body[0])
+        # KWin 5/6: run the script on its sub-object.
+        sub_path = f"/Scripting/Script{script_id}"
+        ran = False
+        for iface in ("org.kde.kwin.Script", "org.kde.kwin.Scripting"):
             try:
-                proxy.start()
-            except Exception:  # noqa: BLE001
-                pass
-        return True
-    except Exception as exc:  # noqa: BLE001
+                call(conn, service, sub_path, iface, "run")
+                ran = True
+                break
+            except DBusError:
+                continue
+        if not ran:
+            # Older KWin: call start() on the root scripting object.
+            try:
+                call(conn, service, scripting_path, scripting_iface, "start")
+                ran = True
+            except DBusError as exc:
+                log.debug("KWin script start() also failed: %s", exc)
+        return ran
+    except DBusError as exc:
         log.debug("KWin scripting D-Bus call failed: %s", exc)
         return False
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _write_kwin_script() -> str | None:
@@ -261,15 +297,27 @@ def _write_kwin_script() -> str | None:
 
 def have_kwin_dbus() -> bool:
     """Cheap test for whether KWin's D-Bus service is reachable."""
-    try:
-        from dasbus.connection import SessionMessageBus
+    from .dbus_util import DBusError, call, open_bus
 
-        bus = SessionMessageBus()
-        proxy = bus.get_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus")
-        names = proxy.ListNames()
-        return "org.kde.KWin" in names
-    except Exception:  # noqa: BLE001
+    conn = open_bus("SESSION")
+    if conn is None:
         return False
+    try:
+        body = call(
+            conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ListNames",
+        )
+        return bool(body) and "org.kde.KWin" in body[0]
+    except DBusError:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def kwin_helper_available() -> bool:

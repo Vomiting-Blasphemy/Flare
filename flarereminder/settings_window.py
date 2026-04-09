@@ -11,7 +11,7 @@ import sys
 from typing import Callable
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QColor, QPixmap
+from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -121,7 +121,7 @@ class ReminderDialog(QDialog):
 
     def _refresh_color_btn(self) -> None:
         self._color_btn.setText(f"RGBA{self._color}")
-        self._color_btn.setIcon(_color_swatch(self._color))
+        self._color_btn.setIcon(QIcon(_color_swatch(self._color)))
 
     def _pick_color(self) -> None:
         initial = QColor(*self._color)

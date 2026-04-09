@@ -87,10 +87,14 @@ class HotkeyManager(QObject):
 
     triggered = pyqtSignal()
 
+    # KGlobalAccel constants (see kglobalaccel/src/kglobalaccel.h).
+    _KGA_NO_AUTOLOADING = 0x0   # SetShortcutFlag::NoAutoloading
+    _KGA_AUTOLOADING = 0x1      # SetShortcutFlag::Autoloading
+
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._strategy: str | None = None
-        self._dbus_objs: list[object] = []
+        self._listener = None                 # DBusSignalListener, if any
         self._current: str | None = None
 
     def strategy(self) -> str | None:
@@ -128,22 +132,44 @@ class HotkeyManager(QObject):
         return self._strategy
 
     def unregister(self) -> None:
-        # Best-effort: drop our references; KGlobalAccel will GC the action
-        # when our component name is no longer claimed.
-        self._dbus_objs.clear()
+        if self._listener is not None:
+            try:
+                self._listener.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._listener = None
         self._strategy = None
 
     # ---- KGlobalAccel ---------------------------------------------------
 
     def _try_kglobalaccel(self, hotkey: str) -> bool:
-        try:
-            from dasbus.connection import SessionMessageBus
-        except ImportError:
+        """Register an action with KGlobalAccel over D-Bus (jeepney).
+
+        KDE Plasma 6's KGlobalAccel exposes:
+
+            service   org.kde.kglobalaccel
+            path      /kglobalaccel
+            interface org.kde.KGlobalAccel
+            methods:
+                doRegister(as)           — declare the action
+                setShortcut(as, ai, u)   — install [keys] with flags
+                getComponent(s) -> o     — per-component object path
+            component object:
+                path      /component/<componentUnique>
+                interface org.kde.kglobalaccel.Component
+                signal    globalShortcutPressed(s, s, x)
+        """
+        from .dbus_util import DBusError, DBusSignalListener, call, open_bus
+
+        key_int = hotkey_to_qt_int(hotkey)
+        if key_int == 0:
+            log.warning("hotkey_to_qt_int returned 0 for %r", hotkey)
             return False
 
-        bus = SessionMessageBus()
-        proxy = bus.get_proxy("org.kde.kglobalaccel", "/kglobalaccel")
-        # Component object path for our action group.
+        conn = open_bus("SESSION")
+        if conn is None:
+            return False
+
         component_unique = __app_id__
         component_friendly = __app_name__
         action_unique = "acknowledge"
@@ -155,72 +181,129 @@ class HotkeyManager(QObject):
             action_friendly,
         ]
 
-        key_int = hotkey_to_qt_int(hotkey)
-        if key_int == 0:
-            log.warning("hotkey_to_qt_int returned 0 for %r", hotkey)
-            return False
+        service = "org.kde.kglobalaccel"
+        kga_path = "/kglobalaccel"
+        kga_iface = "org.kde.KGlobalAccel"
 
-        # SetShortcut(actionId, [keys], flags) -> [returned keys]
-        # flags: 0=NoAutoloading, 4=Autoloading
+        # Step 1: doRegister(QStringList actionId)
         try:
-            proxy.setShortcut(action_id, [key_int], 4)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("setShortcut failed: %s", exc)
+            call(
+                conn, service, kga_path, kga_iface,
+                "doRegister", "as", (action_id,),
+            )
+        except DBusError as exc:
+            log.debug("KGlobalAccel.doRegister failed: %s", exc)
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
             return False
 
-        # Subscribe to the press signal.
-        def on_pressed(component: str, action: str, ts: int) -> None:
+        # Step 2: setShortcut(actionId, [keys], NoAutoloading)
+        try:
+            call(
+                conn, service, kga_path, kga_iface,
+                "setShortcut", "asaiu",
+                (action_id, [key_int], self._KGA_NO_AUTOLOADING),
+            )
+        except DBusError as exc:
+            log.debug("KGlobalAccel.setShortcut failed: %s", exc)
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+        # Step 3: getComponent(componentUnique) -> object path
+        component_path: str | None = None
+        try:
+            body = call(
+                conn, service, kga_path, kga_iface,
+                "getComponent", "s", (component_unique,),
+            )
+            if body:
+                component_path = str(body[0])
+                log.debug("KGlobalAccel component path: %s", component_path)
+        except DBusError as exc:
+            log.debug(
+                "KGlobalAccel.getComponent failed: %s (will match on interface only)",
+                exc,
+            )
+
+        # The probe conn is not used for signal listening; close it. The
+        # DBusSignalListener below opens its own connection.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Step 4: listen for globalShortcutPressed signals from our component.
+        listener = DBusSignalListener("SESSION")
+        if not listener.start():
+            log.warning("Could not open session bus for KGlobalAccel listener")
+            return False
+
+        def on_pressed(*body) -> None:
+            # Signal body: (componentUnique: str, shortcutUnique: str, ts: int)
+            if len(body) < 2:
+                return
+            component = str(body[0])
+            action = str(body[1])
             if component == component_unique and action == action_unique:
                 log.debug("Hotkey pressed via KGlobalAccel")
                 self.triggered.emit()
 
-        try:
-            proxy.globalShortcutPressed.connect(on_pressed)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("Could not connect globalShortcutPressed: %s", exc)
+        ok = listener.subscribe(
+            path=component_path,  # May be None; match on interface+member then.
+            interface="org.kde.kglobalaccel.Component",
+            member="globalShortcutPressed",
+            callback=on_pressed,
+        )
+        if not ok:
+            listener.stop()
             return False
 
-        self._dbus_objs.append(proxy)
+        self._listener = listener
         return True
 
     # ---- xdg-desktop-portal --------------------------------------------
 
     def _try_portal(self, hotkey: str) -> bool:
-        try:
-            from dasbus.connection import SessionMessageBus
-        except ImportError:
-            return False
+        """Portal GlobalShortcuts fallback probe.
 
-        bus = SessionMessageBus()
+        The full portal flow requires CreateSession, BindShortcuts, and an
+        Activated signal handler — in practice KGlobalAccel covers every
+        modern KDE Plasma 6 install, so we just probe the portal's
+        existence and log a clear note.
+        """
+        from .dbus_util import DBusError, call, open_bus
+
+        conn = open_bus("SESSION")
+        if conn is None:
+            return False
         try:
-            proxy = bus.get_proxy(
+            # Ping the portal's root object. If it doesn't exist the call
+            # returns an UnknownService / UnknownObject error.
+            call(
+                conn,
                 "org.freedesktop.portal.Desktop",
                 "/org/freedesktop/portal/desktop",
+                "org.freedesktop.DBus.Peer",
+                "Ping",
             )
-        except Exception as exc:  # noqa: BLE001
-            log.debug("portal D-Bus unreachable: %s", exc)
-            return False
-
-        # The portal API is multi-step (CreateSession, BindShortcuts, then
-        # listen for Activated signals). We do a minimal best-effort here;
-        # full portal flow is honestly not worth the complexity for this
-        # spec, and KGlobalAccel works on every modern KDE Plasma 6 install.
-        try:
-            handle = proxy.CreateSession(
-                {"session_handle_token": "flarereminder"}
+            log.warning(
+                "xdg-desktop-portal is reachable but the full GlobalShortcuts "
+                "bind flow is intentionally not implemented. "
+                "Use the tray menu to acknowledge flares or configure a "
+                "shortcut manually in KDE System Settings."
             )
-            log.debug("Portal CreateSession returned %s", handle)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("Portal CreateSession failed: %s", exc)
-            return False
-
-        # We don't fully wire BindShortcuts/Activated here — KGlobalAccel
-        # is the realistic path on KDE. Returning False steers us to the
-        # "none" strategy with a clear log message.
-        log.warning(
-            "Portal GlobalShortcuts is reachable but full bind flow is "
-            "not implemented; falling back to tray-only acknowledgement"
-        )
+        except DBusError as exc:
+            log.debug("portal Ping failed: %s", exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
         return False
 
 

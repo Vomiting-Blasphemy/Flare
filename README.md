@@ -22,12 +22,17 @@ FlareReminder targets Arch Linux + KDE Plasma 6 + Wayland. On that
 platform:
 
 ```sh
-# System dependencies (almost certainly already installed on KDE)
-sudo pacman -S python-gobject xdg-desktop-portal-kde
+# Hotkey + idle/lock fallback (ships by default on KDE Plasma 6)
+sudo pacman -S xdg-desktop-portal-kde
 
 # Strongly recommended: ensures the overlay stacks above fullscreen games
 sudo pacman -S layer-shell-qt
 ```
+
+FlareReminder's D-Bus client is **jeepney** (pure Python), so no
+PyGObject / `python-gobject` / GObject-Introspection headers are
+required on the target machine — the bundled binary is fully
+self-contained apart from Qt's own Wayland plugins.
 
 Then grab the prebuilt standalone binary from `dist/flarereminder` (see
 "Build" below) and put it somewhere on your `PATH`.
@@ -121,13 +126,16 @@ right-clicking the tray icon and picking "View This Session Stats" or
 using a test flare action — or configure a different hotkey via
 System Settings → Shortcuts manually.
 
-**dasbus + PyGObject.** dasbus runs its event loop on GLib via
-PyGObject (`import gi`). PyGObject isn't pip-installable without
-GObject-Introspection dev headers, so it isn't listed in
-`requirements.txt`. On KDE Plasma Arch installs it is always present as
-the `python-gobject` system package. If it isn't, every D-Bus feature
-(hotkey, idle, lock, sleep) fails gracefully and is logged as a warning
-at startup — the app keeps running but reminders will not auto-pause.
+**D-Bus client.** FlareReminder uses
+[`jeepney`](https://gitlab.com/takluyver/jeepney), a pure-Python
+D-Bus client. It has no C extensions, no `PyGObject`/`gi`/GLib
+dependency, and bundles cleanly into the PyInstaller single-file
+binary. Every D-Bus feature (global hotkey via KGlobalAccel, idle
+detection via `ScreenSaver.GetSessionIdleTime`, lock state via
+`ScreenSaver.ActiveChanged`, sleep via `login1.PrepareForSleep`, and
+the KWin-scripting keep-above fallback) runs through `dbus_util.py`,
+which dispatches inbound signals from a background worker thread
+back onto the Qt main thread via a `QueuedConnection`.
 
 ## Files and paths
 
@@ -158,6 +166,7 @@ flarereminder/
 ├── layer_shell.py       # LayerShellQt / KWin-script / keep-above fallback
 ├── scheduler.py         # timers + idle/lock/sleep/suspend pause logic
 ├── hotkey.py            # KGlobalAccel + portal + KeyComboRecorder
+├── dbus_util.py         # jeepney-based D-Bus call helper + signal listener
 ├── tray.py              # QSystemTrayIcon wrapper
 ├── settings_window.py   # 4-tab QTabWidget UI
 ├── autostart.py         # ~/.config/autostart/*.desktop writer

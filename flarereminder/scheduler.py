@@ -265,120 +265,140 @@ class Scheduler(QObject):
 # ---- D-Bus subscription helpers ------------------------------------------
 # These are intentionally optional. They live as standalone functions so
 # the Scheduler can be instantiated and unit-tested without any D-Bus.
+#
+# All D-Bus work goes through flarereminder.dbus_util, which wraps jeepney
+# (a pure-Python D-Bus client that bundles cleanly into a PyInstaller
+# single-file binary).
 
 
 def install_dbus_listeners(scheduler: Scheduler) -> list[object]:
-    """Subscribe to ScreenSaver, login1 sleep, KIdleTime signals via dasbus.
+    """Subscribe to ScreenSaver lock + login1 PrepareForSleep via jeepney.
 
-    Returns a list of opaque "subscription handles" the caller should hold
-    onto for as long as it wants the listeners alive. All errors are
-    swallowed and logged at WARNING level.
+    Returns a list of opaque handles the caller must hold so background
+    threads stay alive. All failures are logged at WARNING and swallowed.
     """
+    from .dbus_util import DBusSignalListener
+
     handles: list[object] = []
 
-    # ScreenSaver lock state.
-    try:
-        from dasbus.connection import SessionMessageBus
-
-        bus = SessionMessageBus()
-        ss_proxy = bus.get_proxy(
-            "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"
-        )
-
+    # Session bus: ScreenSaver.ActiveChanged(bool)
+    session = DBusSignalListener("SESSION")
+    if session.start():
         def on_active_changed(active: bool) -> None:
             if active:
                 scheduler.pause("lock")
             else:
                 scheduler.resume("lock")
 
-        try:
-            ss_proxy.ActiveChanged.connect(on_active_changed)
-            handles.append(ss_proxy)
-            log.info("Subscribed to ScreenSaver.ActiveChanged")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not connect to ScreenSaver.ActiveChanged: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("ScreenSaver D-Bus unavailable: %s", exc)
-
-    # login1 PrepareForSleep.
-    try:
-        from dasbus.connection import SystemMessageBus
-
-        sysbus = SystemMessageBus()
-        login_proxy = sysbus.get_proxy(
-            "org.freedesktop.login1", "/org/freedesktop/login1"
+        ok = session.subscribe(
+            interface="org.freedesktop.ScreenSaver",
+            member="ActiveChanged",
+            callback=on_active_changed,
         )
+        if ok:
+            log.info("Subscribed to ScreenSaver.ActiveChanged (jeepney)")
+            handles.append(session)
+        else:
+            session.stop()
+            log.warning("Could not subscribe to ScreenSaver.ActiveChanged")
+    else:
+        log.warning("Session bus unavailable; lock-screen auto-pause disabled")
 
+    # System bus: login1.Manager.PrepareForSleep(bool)
+    system = DBusSignalListener("SYSTEM")
+    if system.start():
         def on_prepare_for_sleep(going_to_sleep: bool) -> None:
             if going_to_sleep:
                 scheduler.pause("sleep")
             else:
                 scheduler.resume("sleep")
 
-        try:
-            login_proxy.PrepareForSleep.connect(on_prepare_for_sleep)
-            handles.append(login_proxy)
-            log.info("Subscribed to login1.PrepareForSleep")
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not connect to login1.PrepareForSleep: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("login1 D-Bus unavailable: %s", exc)
+        ok = system.subscribe(
+            path="/org/freedesktop/login1",
+            interface="org.freedesktop.login1.Manager",
+            member="PrepareForSleep",
+            callback=on_prepare_for_sleep,
+        )
+        if ok:
+            log.info("Subscribed to login1.PrepareForSleep (jeepney)")
+            handles.append(system)
+        else:
+            system.stop()
+            log.warning("Could not subscribe to login1.PrepareForSleep")
+    else:
+        log.warning("System bus unavailable; sleep auto-pause disabled")
 
     return handles
 
 
 def install_idle_watcher(scheduler: Scheduler, threshold_seconds: int) -> object | None:
-    """Best-effort idle watcher.
+    """Best-effort idle watcher via ``ScreenSaver.GetSessionIdleTime``.
 
-    Tries (in order):
-    1. ``ext_idle_notify_v1`` via pywayland
-    2. polling ``org.freedesktop.ScreenSaver.GetSessionIdleTime`` once a second
+    Runs on a 2-second ``QTimer`` that polls
+    ``org.freedesktop.ScreenSaver.GetSessionIdleTime`` on the session bus
+    and toggles ``pause("idle")`` / ``resume("idle")`` on the scheduler.
 
     Returns a handle that should be held while the watcher is active, or
-    None if no idle source could be set up.
+    None if the bus or method was unavailable.
     """
-    # Try poll-based ScreenSaver fallback first — simpler and more portable
-    # than wiring a full pywayland event loop. The pywayland path requires
-    # a running Wayland display which we may not always have.
-    try:
-        from dasbus.connection import SessionMessageBus
+    from .dbus_util import DBusError, call, open_bus
 
-        bus = SessionMessageBus()
-        proxy = bus.get_proxy(
-            "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"
-        )
-
-        # Probe once to make sure the call is supported.
-        try:
-            _ = proxy.GetSessionIdleTime()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("ScreenSaver.GetSessionIdleTime not supported: %s", exc)
-            return None
-
-        timer = QTimer()
-        timer.setInterval(2000)
-        state = {"is_idle": False}
-
-        def tick() -> None:
-            try:
-                idle_ms = int(proxy.GetSessionIdleTime())
-            except Exception:  # noqa: BLE001
-                return
-            should_idle = idle_ms >= threshold_seconds * 1000
-            if should_idle and not state["is_idle"]:
-                state["is_idle"] = True
-                scheduler.pause("idle")
-            elif not should_idle and state["is_idle"]:
-                state["is_idle"] = False
-                scheduler.resume("idle")
-
-        timer.timeout.connect(tick)
-        timer.start()
-        log.info(
-            "Idle watcher installed (ScreenSaver.GetSessionIdleTime, threshold=%ds)",
-            threshold_seconds,
-        )
-        return timer
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Idle watcher unavailable: %s", exc)
+    conn = open_bus("SESSION")
+    if conn is None:
+        log.warning("Idle watcher unavailable (no session bus)")
         return None
+
+    # Probe that GetSessionIdleTime is reachable before installing the tick.
+    try:
+        call(
+            conn,
+            "org.freedesktop.ScreenSaver",
+            "/org/freedesktop/ScreenSaver",
+            "org.freedesktop.ScreenSaver",
+            "GetSessionIdleTime",
+        )
+    except DBusError as exc:
+        log.warning("ScreenSaver.GetSessionIdleTime not supported: %s", exc)
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    timer = QTimer()
+    timer.setInterval(2000)
+    state = {"is_idle": False}
+
+    def tick() -> None:
+        try:
+            body = call(
+                conn,
+                "org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                "org.freedesktop.ScreenSaver",
+                "GetSessionIdleTime",
+            )
+        except DBusError:
+            return
+        if not body:
+            return
+        try:
+            idle_ms = int(body[0])
+        except (TypeError, ValueError):
+            return
+        should_idle = idle_ms >= threshold_seconds * 1000
+        if should_idle and not state["is_idle"]:
+            state["is_idle"] = True
+            scheduler.pause("idle")
+        elif not should_idle and state["is_idle"]:
+            state["is_idle"] = False
+            scheduler.resume("idle")
+
+    timer.timeout.connect(tick)
+    timer.start()
+    log.info(
+        "Idle watcher installed (ScreenSaver.GetSessionIdleTime, threshold=%ds)",
+        threshold_seconds,
+    )
+    # Keep conn alive by returning both.
+    return (timer, conn)

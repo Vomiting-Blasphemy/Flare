@@ -2,3 +2,7 @@ PyQt6>=6.6
 pywayland>=0.4.17
 dasbus>=1.7
 PyInstaller>=6.0
+# Note: dasbus needs PyGObject (the `gi` module) at runtime. On Arch Linux
+# install it from the system package manager:  sudo pacman -S python-gobject
+# PyGObject is NOT pip-installable without GObject Introspection dev headers,
+# and on a KDE Plasma install it is virtually always already present.

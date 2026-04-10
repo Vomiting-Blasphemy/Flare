@@ -109,11 +109,11 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_AlwaysStackOnTop, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         # Window class — used by KWin scripting fallback to find the window.
+        # Only set objectName on this widget; do NOT call
+        # QGuiApplication.setDesktopFileName() here because that changes
+        # the app_id for ALL windows (including the settings dialog),
+        # which can break their window decorations and close buttons.
         self.setObjectName(OVERLAY_WINDOW_CLASS)
-        try:
-            QGuiApplication.setDesktopFileName(OVERLAY_WINDOW_CLASS)
-        except Exception:  # noqa: BLE001
-            pass
 
         # Periodic raise timer: re-assert stacking order while visible.
         self._raise_timer = QTimer(self)

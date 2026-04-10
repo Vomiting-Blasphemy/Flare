@@ -138,6 +138,7 @@ class App:
 
         # Tray menu
         tray.open_settings.connect(self._show_settings)
+        tray.toggle_settings.connect(self._toggle_settings)
         tray.acknowledge_all.connect(self._on_ack_hotkey)
         tray.suspend_for.connect(self._on_suspend_for)
         tray.resume_now.connect(self._on_resume_now)
@@ -259,6 +260,14 @@ class App:
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
+
+    def _toggle_settings(self) -> None:
+        if self.settings_window is None:
+            return
+        if self.settings_window.isVisible():
+            self.settings_window.hide()
+        else:
+            self._show_settings()
 
     def _show_session_stats(self) -> None:
         if self.settings_window is None:

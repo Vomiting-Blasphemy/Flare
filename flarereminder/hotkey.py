@@ -151,8 +151,9 @@ class HotkeyManager(QObject):
             path      /kglobalaccel
             interface org.kde.KGlobalAccel
             methods:
-                doRegister(as)           — declare the action
-                setShortcut(as, ai, u)   — install [keys] with flags
+                doRegister(as)           — declare the action (optional, may not exist)
+                setShortcut(as, ai, u)   — install [keys] with flags (also registers)
+                setForeignShortcut(as, ai)  — alternate method on some KDE versions
                 getComponent(s) -> o     — per-component object path
             component object:
                 path      /component/<componentUnique>
@@ -165,6 +166,8 @@ class HotkeyManager(QObject):
         if key_int == 0:
             log.warning("hotkey_to_qt_int returned 0 for %r", hotkey)
             return False
+
+        log.debug("KGlobalAccel: key_int for %r = 0x%08X", hotkey, key_int)
 
         conn = open_bus("SESSION")
         if conn is None:
@@ -185,36 +188,46 @@ class HotkeyManager(QObject):
         kga_path = "/kglobalaccel"
         kga_iface = "org.kde.KGlobalAccel"
 
-        # Step 1: doRegister(QStringList actionId)
+        # Step 1: doRegister — this is optional and may not exist on all
+        # KDE versions.  Do NOT bail out if it fails; setShortcut alone
+        # also registers the action.
         try:
             call(
                 conn, service, kga_path, kga_iface,
                 "doRegister", "as", (action_id,),
             )
+            log.debug("KGlobalAccel.doRegister succeeded")
         except DBusError as exc:
-            log.debug("KGlobalAccel.doRegister failed: %s", exc)
+            log.debug("KGlobalAccel.doRegister failed (non-fatal, continuing): %s", exc)
+
+        # Step 2: setShortcut — this both registers and sets the keys.
+        # Try the standard method first, then fallbacks for different KDE versions.
+        shortcut_set = False
+        for method, sig, body in [
+            ("setShortcut", "asaiu", (action_id, [key_int], self._KGA_NO_AUTOLOADING)),
+            ("setForeignShortcut", "asai", (action_id, [key_int])),
+        ]:
+            try:
+                result = call(
+                    conn, service, kga_path, kga_iface,
+                    method, sig, body,
+                )
+                log.info("KGlobalAccel.%s succeeded (result=%s)", method, result)
+                shortcut_set = True
+                break
+            except DBusError as exc:
+                log.debug("KGlobalAccel.%s failed: %s", method, exc)
+
+        if not shortcut_set:
+            log.warning("All KGlobalAccel shortcut registration methods failed")
             try:
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
             return False
 
-        # Step 2: setShortcut(actionId, [keys], NoAutoloading)
-        try:
-            call(
-                conn, service, kga_path, kga_iface,
-                "setShortcut", "asaiu",
-                (action_id, [key_int], self._KGA_NO_AUTOLOADING),
-            )
-        except DBusError as exc:
-            log.debug("KGlobalAccel.setShortcut failed: %s", exc)
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            return False
-
-        # Step 3: getComponent(componentUnique) -> object path
+        # Step 3: getComponent(componentUnique) -> object path.
+        # Try to get the exact component path for signal matching.
         component_path: str | None = None
         try:
             body = call(
@@ -237,7 +250,8 @@ class HotkeyManager(QObject):
         except Exception:  # noqa: BLE001
             pass
 
-        # Step 4: listen for globalShortcutPressed signals from our component.
+        # Step 4: listen for globalShortcutPressed signals.
+        # Try subscribing on the component path first, then on any path.
         listener = DBusSignalListener("SESSION")
         if not listener.start():
             log.warning("Could not open session bus for KGlobalAccel listener")
@@ -245,21 +259,38 @@ class HotkeyManager(QObject):
 
         def on_pressed(*body) -> None:
             # Signal body: (componentUnique: str, shortcutUnique: str, ts: int)
+            log.debug("KGlobalAccel signal received: body=%s", body)
             if len(body) < 2:
                 return
             component = str(body[0])
             action = str(body[1])
             if component == component_unique and action == action_unique:
-                log.debug("Hotkey pressed via KGlobalAccel")
+                log.info("Hotkey pressed via KGlobalAccel")
                 self.triggered.emit()
 
-        ok = listener.subscribe(
-            path=component_path,  # May be None; match on interface+member then.
-            interface="org.kde.kglobalaccel.Component",
-            member="globalShortcutPressed",
-            callback=on_pressed,
-        )
+        # Try subscribing with the component path first, then without.
+        ok = False
+        if component_path:
+            ok = listener.subscribe(
+                path=component_path,
+                interface="org.kde.kglobalaccel.Component",
+                member="globalShortcutPressed",
+                callback=on_pressed,
+            )
+            if ok:
+                log.debug("Subscribed to globalShortcutPressed on path %s", component_path)
         if not ok:
+            # Fallback: match on interface+member only (any path).
+            ok = listener.subscribe(
+                interface="org.kde.kglobalaccel.Component",
+                member="globalShortcutPressed",
+                callback=on_pressed,
+            )
+            if ok:
+                log.debug("Subscribed to globalShortcutPressed (any path)")
+
+        if not ok:
+            log.warning("Could not subscribe to globalShortcutPressed signal")
             listener.stop()
             return False
 

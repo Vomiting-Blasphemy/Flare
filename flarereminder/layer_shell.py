@@ -212,35 +212,69 @@ def _try_layer_shell_qt(qwindow: Any) -> bool:
 _KWIN_SCRIPT_TEMPLATE = textwrap.dedent(
     """
     // FlareReminder overlay keep-above script.
+    // Compatible with both KDE Plasma 5 (KWin 5.x) and Plasma 6 (KWin 6.x).
     // Finds windows whose resourceClass matches our app id and forces them
     // to be kept above all others, skipped from taskbar/pager, borderless.
     function fixOverlay(client) {
         if (!client) return;
         try {
-            var cls = (client.resourceClass || "").toString();
+            var cls = (client.resourceClass || client.resourceName || "").toString();
             if (cls.indexOf("__APP_ID__") !== -1) {
                 client.keepAbove = true;
                 client.skipTaskbar = true;
                 client.skipPager = true;
-                client.skipSwitcher = true;
+                try { client.skipSwitcher = true; } catch(e) {}
                 client.noBorder = true;
-                client.onAllDesktops = true;
+                try { client.onAllDesktops = true; } catch(e) {}
             }
         } catch (e) {}
     }
-    workspace.clientAdded.connect(fixOverlay);
-    // Existing windows.
-    var clients = workspace.clientList ? workspace.clientList() : workspace.windowList();
-    for (var i = 0; i < clients.length; i++) fixOverlay(clients[i]);
+
+    // Plasma 6 uses workspace.windowAdded; Plasma 5 uses workspace.clientAdded.
+    try {
+        if (workspace.windowAdded) {
+            workspace.windowAdded.connect(fixOverlay);
+        }
+    } catch(e) {}
+    try {
+        if (workspace.clientAdded) {
+            workspace.clientAdded.connect(fixOverlay);
+        }
+    } catch(e) {}
+
+    // Process existing windows.
+    // Plasma 6: workspace.windowList (property, an array)
+    // Plasma 5: workspace.clientList() (function returning an array)
+    var clients = [];
+    try {
+        if (typeof workspace.windowList !== 'undefined') {
+            clients = workspace.windowList;
+        }
+    } catch(e) {}
+    if (!clients || clients.length === 0) {
+        try {
+            if (typeof workspace.clientList === 'function') {
+                clients = workspace.clientList();
+            }
+        } catch(e) {}
+    }
+    if (clients) {
+        for (var i = 0; i < clients.length; i++) fixOverlay(clients[i]);
+    }
     """
 ).strip()
 
 
-def _try_kwin_keep_above_script() -> bool:
-    """Install a one-shot KWin script via D-Bus (jeepney).
+_KWIN_SCRIPT_NAME = "flarereminder-overlay"
+_kwin_script_loaded = False
 
-    Returns True if the script was loaded successfully.
+
+def _try_kwin_keep_above_script() -> bool:
+    """Install a KWin script via D-Bus (jeepney).
+
+    Returns True if the script was loaded and run successfully.
     """
+    global _kwin_script_loaded
     from .dbus_util import DBusError, call, open_bus
 
     script_path = _write_kwin_script()
@@ -256,15 +290,35 @@ def _try_kwin_keep_above_script() -> bool:
     scripting_iface = "org.kde.kwin.Scripting"
 
     try:
+        # If already loaded from a previous call, unload first so we can
+        # reload with updated script content.
+        if _kwin_script_loaded:
+            try:
+                call(
+                    conn, service, scripting_path, scripting_iface,
+                    "unloadScript", "s", (_KWIN_SCRIPT_NAME,),
+                )
+                log.debug("Unloaded previous KWin script")
+            except DBusError:
+                pass
+
         # loadScript(filePath, pluginName) -> int scriptId
         body = call(
             conn, service, scripting_path, scripting_iface,
-            "loadScript", "ss", (str(script_path), "flarereminder-overlay"),
+            "loadScript", "ss", (str(script_path), _KWIN_SCRIPT_NAME),
         )
         if not body:
             log.debug("KWin loadScript returned no body")
             return False
         script_id = int(body[0])
+
+        if script_id < 0:
+            # -1 means already loaded (shouldn't happen after unload above,
+            # but handle gracefully).
+            log.debug("KWin script already loaded (id=%d)", script_id)
+            _kwin_script_loaded = True
+            return True
+
         # KWin 5/6: run the script on its sub-object.
         sub_path = f"/Scripting/Script{script_id}"
         ran = False
@@ -282,6 +336,7 @@ def _try_kwin_keep_above_script() -> bool:
                 ran = True
             except DBusError as exc:
                 log.debug("KWin script start() also failed: %s", exc)
+        _kwin_script_loaded = ran
         return ran
     except DBusError as exc:
         log.debug("KWin scripting D-Bus call failed: %s", exc)
@@ -300,7 +355,9 @@ def _write_kwin_script() -> str | None:
         script_dir = os.path.join(runtime_dir, "flarereminder")
         os.makedirs(script_dir, exist_ok=True)
         path = os.path.join(script_dir, "overlay-keep-above.js")
-        contents = _KWIN_SCRIPT_TEMPLATE.replace("__APP_ID__", OVERLAY_WINDOW_CLASS)
+        # Match on "flarereminder" (without the "-overlay" suffix) so the
+        # script works regardless of how KWin normalises the resourceClass.
+        contents = _KWIN_SCRIPT_TEMPLATE.replace("__APP_ID__", "flarereminder")
         with open(path, "w", encoding="utf-8") as f:
             f.write(contents)
         return path

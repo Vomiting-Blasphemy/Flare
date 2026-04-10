@@ -26,12 +26,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QGuiApplication, QPainter, QPaintEvent
+from PyQt6.QtGui import QGuiApplication, QPainter, QPaintEvent, QRegion
 from PyQt6.QtWidgets import QWidget
 
 from .config import GlobalSettings, Reminder
 from .flare_renderer import FlareParams, blend_colors, render_flare
-from .layer_shell import OVERLAY_WINDOW_CLASS, apply_overlay_layer, reapply_kwin_keep_above
+from .layer_shell import OVERLAY_WINDOW_CLASS, apply_overlay_layer
 
 log = logging.getLogger(__name__)
 
@@ -78,14 +78,28 @@ class OverlayWindow(QWidget):
     # ---- window configuration --------------------------------------------
 
     def _configure_window_flags(self) -> None:
-        # Do NOT use BypassWindowManagerHint — it's an X11 concept and on
-        # Wayland it prevents the compositor from managing stacking at all,
-        # making the window go behind others when focus changes.
+        # Window flags chosen for KDE Plasma Wayland:
+        #
+        # - Window (NOT Tool): Tool windows are transient children that get
+        #   lowered when the parent app loses focus. A regular Window with
+        #   WindowStaysOnTopHint is treated as an independent top-level by
+        #   KWin, so keepAbove survives focus changes.
+        #
+        # - WindowDoesNotAcceptFocus: tells the Wayland compositor not to
+        #   give this window keyboard focus, so it never steals input from
+        #   games or other fullscreen apps.
+        #
+        # - WindowTransparentForInput: Qt-level hint to set an empty input
+        #   region on Wayland so mouse events pass through.
+        #
+        # skipTaskbar / skipPager / skipSwitcher are handled by the KWin
+        # script since Qt flags alone don't cover those on Wayland.
         flags = (
-            Qt.WindowType.FramelessWindowHint
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
             | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -191,6 +205,15 @@ class OverlayWindow(QWidget):
                 handle = self.windowHandle()
                 if handle is not None:
                     self._strategy = apply_overlay_layer(handle)
+                    # Set an empty input region on the Wayland surface so that
+                    # the compositor never routes mouse/touch events to us.
+                    # On Wayland, QWindow.setMask() maps to
+                    # wl_surface.set_input_region(); an empty QRegion means
+                    # no part of the surface accepts input.
+                    try:
+                        handle.setMask(QRegion())
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as exc:  # noqa: BLE001
                 log.warning("apply_overlay_layer failed: %s", exc)
             self._frame_timer.start()
@@ -238,7 +261,6 @@ class OverlayWindow(QWidget):
         """Re-assert stacking while visible so the overlay stays on top."""
         if self.isVisible():
             self.raise_()
-            reapply_kwin_keep_above()
 
     # ---- painting --------------------------------------------------------
 

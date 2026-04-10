@@ -47,6 +47,7 @@ class FlareParams:
     pulse_phase: float = 0.0          # radians, used for pulse animation
     pulse_intensity: float = 0.10     # 10% sinusoidal swing
     intensity_multiplier: float = 1.0  # global×reminder override
+    transparency: float = 1.0          # 0.0=invisible, 1.0=fully opaque
     # Origin offset from the upper-right corner; default is exactly the
     # corner. Negative x moves left, positive y moves down.
     origin_offset: tuple[int, int] = field(default=(0, 0))
@@ -75,6 +76,7 @@ def render_flare(painter: QPainter, rect: QRectF, params: FlareParams) -> None:
         eff_intensity = (
             max(0.0, min(1.0, params.intensity))
             * max(0.0, params.intensity_multiplier)
+            * max(0.0, min(1.0, params.transparency))
             * pulse
         )
         if eff_intensity <= 0.0:
@@ -218,16 +220,30 @@ def _draw_secondary_artifacts(
 
 
 def blend_colors(colors: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
-    """Additively blend a list of RGBA colors, clamped per channel.
+    """Blend a list of RGBA colors using weighted averaging for visible mixing.
+
+    Uses a brightness-weighted average so that combining white + cornflower
+    blue produces a visible blue-tinted result rather than pure white.
+    Alpha is taken as the maximum across all inputs.
 
     Empty list returns transparent black.
     """
     if not colors:
         return (0, 0, 0, 0)
-    r = g = b = a = 0
+    if len(colors) == 1:
+        return colors[0]
+    n = len(colors)
+    r_sum = g_sum = b_sum = 0
+    a_max = 0
     for cr, cg, cb, ca in colors:
-        r += cr
-        g += cg
-        b += cb
-        a = max(a, ca)  # alpha = max, not sum
-    return (min(255, r), min(255, g), min(255, b), min(255, a))
+        r_sum += cr
+        g_sum += cg
+        b_sum += cb
+        a_max = max(a_max, ca)
+    # Average the RGB channels so that distinct hues remain visible.
+    return (
+        min(255, r_sum // n),
+        min(255, g_sum // n),
+        min(255, b_sum // n),
+        min(255, a_max),
+    )

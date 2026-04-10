@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import QWidget
 
 from .config import GlobalSettings, Reminder
 from .flare_renderer import FlareParams, blend_colors, render_flare
-from .layer_shell import OVERLAY_WINDOW_CLASS, apply_overlay_layer
+from .layer_shell import OVERLAY_WINDOW_CLASS, apply_overlay_layer, reapply_kwin_keep_above
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class _ActiveReminder:
     name: str
     color: tuple[int, int, int, int]
     intensity_override: float  # multiplier; 1.0 if no override
+    transparency: float        # 0.0=invisible, 1.0=opaque
     fired_at: float  # time.monotonic()
     event_id: int | None  # stats event id; set by main wiring
 
@@ -77,13 +78,14 @@ class OverlayWindow(QWidget):
     # ---- window configuration --------------------------------------------
 
     def _configure_window_flags(self) -> None:
+        # Do NOT use BypassWindowManagerHint — it's an X11 concept and on
+        # Wayland it prevents the compositor from managing stacking at all,
+        # making the window go behind others when focus changes.
         flags = (
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowTransparentForInput
-            | Qt.WindowType.BypassWindowManagerHint
-            | Qt.WindowType.X11BypassWindowManagerHint
         )
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -98,6 +100,11 @@ class OverlayWindow(QWidget):
             QGuiApplication.setDesktopFileName(OVERLAY_WINDOW_CLASS)
         except Exception:  # noqa: BLE001
             pass
+
+        # Periodic raise timer: re-assert stacking order while visible.
+        self._raise_timer = QTimer(self)
+        self._raise_timer.setInterval(2000)  # every 2 s
+        self._raise_timer.timeout.connect(self._periodic_raise)
 
     def _size_to_screen(self) -> None:
         screen = QGuiApplication.primaryScreen()
@@ -117,10 +124,16 @@ class OverlayWindow(QWidget):
             if reminder.flare_intensity_override is not None
             else self._settings.flare_intensity
         )
+        transparency = (
+            reminder.flare_transparency
+            if reminder.flare_transparency is not None
+            else self._settings.flare_transparency
+        )
         self._active[reminder.name] = _ActiveReminder(
             name=reminder.name,
             color=reminder.color,
             intensity_override=intensity_mul,
+            transparency=transparency,
             fired_at=time.monotonic(),
             event_id=event_id,
         )
@@ -170,15 +183,18 @@ class OverlayWindow(QWidget):
             self._phase_started = time.monotonic()
             self._size_to_screen()
             if not self.isVisible():
-                self.showFullScreen()
-                # Try to promote to layer-shell after the QWindow exists.
-                try:
-                    handle = self.windowHandle()
-                    if handle is not None:
-                        self._strategy = apply_overlay_layer(handle)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("apply_overlay_layer failed: %s", exc)
+                self.show()
+                self.raise_()
+            # Apply layer-shell / KWin keep-above every time we become visible
+            # so re-shown windows get the stacking treatment again.
+            try:
+                handle = self.windowHandle()
+                if handle is not None:
+                    self._strategy = apply_overlay_layer(handle)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("apply_overlay_layer failed: %s", exc)
             self._frame_timer.start()
+            self._raise_timer.start()
         # If already animating, keep going — new reminder just joins the blend.
         self.update()
 
@@ -211,11 +227,18 @@ class OverlayWindow(QWidget):
                 self._intensity = 0.0
                 self._phase = "idle"
                 self._frame_timer.stop()
+                self._raise_timer.stop()
                 self.hide()
                 self.finished.emit()
                 return
 
         self.update()
+
+    def _periodic_raise(self) -> None:
+        """Re-assert stacking while visible so the overlay stays on top."""
+        if self.isVisible():
+            self.raise_()
+            reapply_kwin_keep_above()
 
     # ---- painting --------------------------------------------------------
 
@@ -227,11 +250,13 @@ class OverlayWindow(QWidget):
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             blended_color = blend_colors([r.color for r in self._active.values()]) if self._active else (255, 255, 255, 255)
-            # Average override across active reminders.
+            # Average overrides across active reminders.
             if self._active:
                 override = sum(r.intensity_override for r in self._active.values()) / len(self._active)
+                transparency = sum(r.transparency for r in self._active.values()) / len(self._active)
             else:
                 override = self._settings.flare_intensity
+                transparency = self._settings.flare_transparency
             pulse_phase = (time.monotonic() * 2.0 * math.pi * PULSE_FREQ_HZ) % (2 * math.pi)
             params = FlareParams(
                 color=blended_color,
@@ -243,6 +268,7 @@ class OverlayWindow(QWidget):
                 pulse_phase=pulse_phase,
                 pulse_intensity=self._settings.pulse_intensity,
                 intensity_multiplier=override,
+                transparency=transparency,
             )
             render_flare(painter, rect, params)
         finally:

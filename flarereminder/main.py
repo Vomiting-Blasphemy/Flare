@@ -112,7 +112,12 @@ class App:
                 "but the tray icon won't appear."
             )
         self.tray = TrayIcon()
-        self.settings_window = SettingsWindow(self.config, self.stats)
+        self.settings_window = SettingsWindow(
+            self.config,
+            self.stats,
+            countdown_provider=self._get_countdown_ms,
+            in_flight_provider=self._is_in_flight,
+        )
 
     def _wire_signals(self) -> None:
         sched = self.scheduler
@@ -133,6 +138,7 @@ class App:
 
         # Tray menu
         tray.open_settings.connect(self._show_settings)
+        tray.acknowledge_all.connect(self._on_ack_hotkey)
         tray.suspend_for.connect(self._on_suspend_for)
         tray.resume_now.connect(self._on_resume_now)
         tray.show_session_stats.connect(self._show_session_stats)
@@ -142,6 +148,8 @@ class App:
         # Settings -> config
         sw.config_changed.connect(self._on_config_changed)
         sw.test_flare_requested.connect(self._on_test_flare)
+        sw.acknowledge_requested.connect(self._on_ack_single)
+        sw.acknowledge_all_requested.connect(self._on_ack_hotkey)
         sw.hotkey_changed.connect(self._on_hotkey_changed)
         sw.quit_requested.connect(self._on_quit)
 
@@ -177,6 +185,23 @@ class App:
             if event_id is not None:
                 self.stats.record_ack(event_id)
             self.scheduler.acknowledge(name)
+
+    def _on_ack_single(self, name: str) -> None:
+        """Acknowledge a single reminder from the settings window."""
+        result = self.overlay.acknowledge(name)
+        if result is not None:
+            _, event_id = result
+            if event_id is not None:
+                self.stats.record_ack(event_id)
+        self.scheduler.acknowledge(name)
+
+    def _get_countdown_ms(self, name: str) -> int:
+        """Provider callback for the settings countdown column."""
+        return self.scheduler.remaining_ms(name)
+
+    def _is_in_flight(self, name: str) -> bool:
+        """Provider callback: True if this reminder has fired but not been acked."""
+        return name in self.overlay._active
 
     def _on_overlay_acknowledged(self, names: list[str]) -> None:
         # Already handled in _on_ack_hotkey when triggered by hotkey;

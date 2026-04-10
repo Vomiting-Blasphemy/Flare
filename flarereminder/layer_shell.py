@@ -309,6 +309,14 @@ def _write_kwin_script() -> str | None:
         return None
 
 
+def reapply_kwin_keep_above() -> None:
+    """Re-run the KWin keep-above script. Called periodically by the overlay."""
+    try:
+        _try_kwin_keep_above_script()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---- diagnostic --------------------------------------------------------
 
 

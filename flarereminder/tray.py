@@ -43,6 +43,7 @@ class TrayIcon(QObject):
     """Wrapper around QSystemTrayIcon with named signals for menu actions."""
 
     open_settings = pyqtSignal()
+    acknowledge_all = pyqtSignal()
     suspend_for = pyqtSignal(int)         # seconds; 0 means until restart
     resume_now = pyqtSignal()
     show_session_stats = pyqtSignal()
@@ -84,6 +85,12 @@ class TrayIcon(QObject):
         a_open = QAction("Open Settings", menu)
         a_open.triggered.connect(self.open_settings)
         menu.addAction(a_open)
+
+        a_ack = QAction("Acknowledge All Flares", menu)
+        a_ack.triggered.connect(self.acknowledge_all)
+        menu.addAction(a_ack)
+
+        menu.addSeparator()
 
         # Suspend submenu.
         suspend_menu = QMenu("Suspend Flares", menu)

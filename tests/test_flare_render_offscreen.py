@@ -86,19 +86,24 @@ def test_pulse_phase_changes_brightness(app):
     assert a2b >= a1b
 
 
-def test_blend_colors_additive():
+def test_blend_colors_average():
     red = (255, 0, 0, 255)
     green = (0, 255, 0, 255)
     blue = (0, 0, 255, 255)
-    assert blend_colors([red, green]) == (255, 255, 0, 255)
-    assert blend_colors([red, green, blue]) == (255, 255, 255, 255)
+    # Averaging: red+green -> (127, 127, 0, 255)
+    assert blend_colors([red, green]) == (127, 127, 0, 255)
+    # Three primaries average to ~(85, 85, 85, 255)
+    assert blend_colors([red, green, blue]) == (85, 85, 85, 255)
+    # Two similar colors average properly
     assert blend_colors([(100, 50, 0, 200), (200, 50, 0, 100)]) == (
-        255,
-        100,
+        150,
+        50,
         0,
         200,
     )
     assert blend_colors([]) == (0, 0, 0, 0)
+    # Single color passes through unchanged
+    assert blend_colors([red]) == red
 
 
 def test_color_is_respected(app):

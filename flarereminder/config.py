@@ -33,6 +33,7 @@ class Reminder:
     interval_minutes: int
     enabled: bool = True
     flare_intensity_override: float | None = None  # None == use global
+    flare_transparency: float | None = None  # None == use global; 0.0=invisible, 1.0=opaque
 
     def __post_init__(self) -> None:
         if self.interval_minutes < 1:
@@ -48,6 +49,11 @@ class Reminder:
             self.flare_intensity_override = max(
                 0.0, min(2.0, self.flare_intensity_override)
             )
+        if (
+            self.flare_transparency is not None
+            and not 0.0 <= self.flare_transparency <= 1.0
+        ):
+            self.flare_transparency = max(0.0, min(1.0, self.flare_transparency))
 
 
 @dataclass
@@ -65,6 +71,7 @@ class GlobalSettings:
     streak_count: int = 5
     secondary_count: int = 3
     pulse_intensity: float = 0.10  # 10%
+    flare_transparency: float = 1.0  # 0.0=invisible, 1.0=fully opaque
 
     def animation_speed_multiplier(self) -> float:
         return {"slow": 0.5, "normal": 1.0, "fast": 2.0}.get(

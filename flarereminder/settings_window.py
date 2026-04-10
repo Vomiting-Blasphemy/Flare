@@ -10,7 +10,7 @@ import logging
 import sys
 from typing import Callable
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -112,6 +112,22 @@ class ReminderDialog(QDialog):
         layout.addRow("", self._intensity_override_enable)
         layout.addRow("Intensity override:", self._intensity_override)
 
+        self._transparency_override_enable = QCheckBox("Override global transparency")
+        self._transparency_override = QDoubleSpinBox()
+        self._transparency_override.setRange(0.0, 1.0)
+        self._transparency_override.setSingleStep(0.05)
+        self._transparency_override.setDecimals(2)
+        if reminder and reminder.flare_transparency is not None:
+            self._transparency_override_enable.setChecked(True)
+            self._transparency_override.setValue(reminder.flare_transparency)
+            self._transparency_override.setEnabled(True)
+        else:
+            self._transparency_override.setValue(1.0)
+            self._transparency_override.setEnabled(False)
+        self._transparency_override_enable.toggled.connect(self._transparency_override.setEnabled)
+        layout.addRow("", self._transparency_override_enable)
+        layout.addRow("Transparency override:", self._transparency_override)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -143,6 +159,11 @@ class ReminderDialog(QDialog):
                 if self._intensity_override_enable.isChecked()
                 else None
             ),
+            flare_transparency=(
+                float(self._transparency_override.value())
+                if self._transparency_override_enable.isChecked()
+                else None
+            ),
         )
 
 
@@ -154,6 +175,8 @@ class SettingsWindow(QWidget):
 
     config_changed = pyqtSignal()       # emitted whenever the user saves a change
     test_flare_requested = pyqtSignal(str)         # reminder name; "" = combined
+    acknowledge_requested = pyqtSignal(str)         # reminder name to ack
+    acknowledge_all_requested = pyqtSignal()        # ack every active flare
     quit_requested = pyqtSignal()
     hotkey_changed = pyqtSignal(str)
 
@@ -161,11 +184,15 @@ class SettingsWindow(QWidget):
         self,
         config: AppConfig,
         stats: StatsDB,
+        countdown_provider: Callable[[str], int] | None = None,
+        in_flight_provider: Callable[[str], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
         self._stats = stats
+        self._countdown_provider = countdown_provider
+        self._in_flight_provider = in_flight_provider
         self.setWindowTitle(f"{__app_name__} — Settings")
         self.resize(720, 540)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.Tool)
@@ -177,6 +204,14 @@ class SettingsWindow(QWidget):
         self._tabs.addTab(self._make_stats_tab(), "Statistics")
         self._tabs.addTab(self._make_about_tab(), "About")
         layout.addWidget(self._tabs)
+
+        # Countdown refresh timer — ticks every second while the window is visible.
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._update_countdowns)
+
+        self._countdown_labels: dict[str, QLabel] = {}
+        self._ack_buttons: dict[str, QPushButton] = {}
 
         self._refresh_reminders_table()
 
@@ -202,16 +237,13 @@ class SettingsWindow(QWidget):
         w = QWidget()
         layout = QVBoxLayout(w)
 
-        self._reminders_table = QTableWidget(0, 6)
+        self._reminders_table = QTableWidget(0, 8)
         self._reminders_table.setHorizontalHeaderLabels(
-            ["Enabled", "Name", "Color", "Interval", "Intensity", "Actions"]
+            ["Enabled", "Name", "Color", "Interval", "Intensity", "Countdown", "Acknowledge", "Actions"]
         )
-        self._reminders_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self._reminders_table.horizontalHeader().setSectionResizeMode(
-            5, QHeaderView.ResizeMode.Stretch
-        )
+        header = self._reminders_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self._reminders_table.verticalHeader().setVisible(False)
         self._reminders_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._reminders_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -224,6 +256,9 @@ class SettingsWindow(QWidget):
         test_combined = QPushButton("Test Combined Flare")
         test_combined.clicked.connect(lambda: self.test_flare_requested.emit(""))
         btn_row.addWidget(test_combined)
+        ack_all_btn = QPushButton("Acknowledge All")
+        ack_all_btn.clicked.connect(self.acknowledge_all_requested)
+        btn_row.addWidget(ack_all_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
         return w
@@ -231,6 +266,8 @@ class SettingsWindow(QWidget):
     def _refresh_reminders_table(self) -> None:
         table = self._reminders_table
         table.setRowCount(0)
+        self._countdown_labels.clear()
+        self._ack_buttons.clear()
         for row, reminder in enumerate(self._config.reminders):
             table.insertRow(row)
 
@@ -261,6 +298,19 @@ class SettingsWindow(QWidget):
             text = "global" if override is None else f"{override:.2f}×"
             table.setItem(row, 4, QTableWidgetItem(text))
 
+            # Countdown
+            cd_label = QLabel("--:--")
+            cd_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._countdown_labels[reminder.name] = cd_label
+            table.setCellWidget(row, 5, cd_label)
+
+            # Acknowledge button
+            ack_btn = QPushButton("Ack")
+            ack_btn.setToolTip(f"Acknowledge {reminder.name} and reset its timer")
+            ack_btn.clicked.connect(lambda _checked=False, n=reminder.name: self.acknowledge_requested.emit(n))
+            self._ack_buttons[reminder.name] = ack_btn
+            table.setCellWidget(row, 6, ack_btn)
+
             # Actions
             actions = QWidget()
             al = QHBoxLayout(actions)
@@ -274,7 +324,10 @@ class SettingsWindow(QWidget):
             edit_btn.clicked.connect(lambda _checked=False, n=reminder.name: self._edit_reminder(n))
             del_btn.clicked.connect(lambda _checked=False, n=reminder.name: self._delete_reminder(n))
             test_btn.clicked.connect(lambda _checked=False, n=reminder.name: self.test_flare_requested.emit(n))
-            table.setCellWidget(row, 5, actions)
+            table.setCellWidget(row, 7, actions)
+
+        # Immediately update countdown values.
+        self._update_countdowns()
 
     def _toggle_enabled(self, name: str, checked: bool) -> None:
         r = self._config.find_reminder(name)
@@ -323,6 +376,41 @@ class SettingsWindow(QWidget):
         self._refresh_reminders_table()
         self.config_changed.emit()
 
+    # ---- countdown -------------------------------------------------------
+
+    def _update_countdowns(self) -> None:
+        """Refresh the countdown labels from the scheduler."""
+        for name, label in self._countdown_labels.items():
+            if self._in_flight_provider is not None and self._in_flight_provider(name):
+                label.setText("00:00")
+                label.setStyleSheet("color: red; font-weight: bold;")
+            elif self._countdown_provider is not None:
+                ms = self._countdown_provider(name)
+                if ms <= 0:
+                    label.setText("--:--")
+                    label.setStyleSheet("")
+                else:
+                    total_sec = ms // 1000
+                    mins, secs = divmod(total_sec, 60)
+                    if mins >= 60:
+                        hrs, mins = divmod(mins, 60)
+                        label.setText(f"{hrs}:{mins:02d}:{secs:02d}")
+                    else:
+                        label.setText(f"{mins:02d}:{secs:02d}")
+                    label.setStyleSheet("")
+            else:
+                label.setText("--:--")
+                label.setStyleSheet("")
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._countdown_timer.start()
+        self._update_countdowns()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._countdown_timer.stop()
+
     # ---- Global tab -----------------------------------------------------
 
     def _make_global_tab(self) -> QWidget:
@@ -351,6 +439,28 @@ class SettingsWindow(QWidget):
         intens_row.addWidget(self._intensity)
         intens_w = QWidget(); intens_w.setLayout(intens_row)
         layout.addRow("Global flare intensity:", intens_w)
+
+        # Global transparency
+        self._transparency = QDoubleSpinBox()
+        self._transparency.setRange(0.0, 1.0)
+        self._transparency.setSingleStep(0.05)
+        self._transparency.setDecimals(2)
+        self._transparency.setValue(s.flare_transparency)
+        self._transparency_slider = QSlider(Qt.Orientation.Horizontal)
+        self._transparency_slider.setRange(0, 100)
+        self._transparency_slider.setValue(int(s.flare_transparency * 100))
+        self._transparency_slider.valueChanged.connect(
+            lambda v: self._transparency.setValue(v / 100.0)
+        )
+        self._transparency.valueChanged.connect(
+            lambda v: self._transparency_slider.setValue(int(v * 100))
+        )
+        self._transparency.valueChanged.connect(self._on_global_changed)
+        trans_row = QHBoxLayout()
+        trans_row.addWidget(self._transparency_slider, 1)
+        trans_row.addWidget(self._transparency)
+        trans_w = QWidget(); trans_w.setLayout(trans_row)
+        layout.addRow("Global flare transparency:", trans_w)
 
         self._anim_speed = QComboBox()
         self._anim_speed.addItems(["slow", "normal", "fast"])
@@ -384,6 +494,8 @@ class SettingsWindow(QWidget):
         s = self._config.settings
         self._intensity.setValue(s.flare_intensity)
         self._intensity_slider.setValue(int(s.flare_intensity * 100))
+        self._transparency.setValue(s.flare_transparency)
+        self._transparency_slider.setValue(int(s.flare_transparency * 100))
         self._anim_speed.setCurrentText(s.flare_animation_speed)
         self._idle.setValue(s.idle_timeout_seconds)
         self._hotkey.setText(s.hotkey)
@@ -392,6 +504,7 @@ class SettingsWindow(QWidget):
     def _on_global_changed(self, *args) -> None:
         s = self._config.settings
         s.flare_intensity = float(self._intensity.value())
+        s.flare_transparency = float(self._transparency.value())
         s.flare_animation_speed = self._anim_speed.currentText()
         s.idle_timeout_seconds = int(self._idle.value())
         self.config_changed.emit()

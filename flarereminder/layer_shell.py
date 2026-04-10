@@ -62,9 +62,12 @@ _SYSTEM_QT_PLUGIN_DIRS = (
 )
 
 # The filename Qt looks for when QT_WAYLAND_SHELL_INTEGRATION=layer-shell.
+# On Arch (KDE Plasma 6) the file installed by the `layer-shell-qt` package is
+# /usr/lib/qt6/plugins/wayland-shell-integration/liblayer-shell.so
 _LAYER_SHELL_PLUGIN_BASENAMES = (
-    "libqwayland-layer-shell-integration.so",
-    "libqwayland-layer-shell.so",
+    "liblayer-shell.so",                        # Arch, Fedora, etc.
+    "libqwayland-layer-shell-integration.so",   # some older/different packages
+    "libqwayland-layer-shell.so",               # fallback
 )
 
 

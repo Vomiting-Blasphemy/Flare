@@ -31,7 +31,7 @@ from typing import Any, Callable, Optional
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 
 try:
-    from jeepney import DBusAddress, MessageType, new_method_call
+    from jeepney import DBusAddress, HeaderFields, MessageType, new_method_call
     from jeepney.bus_messages import MatchRule, message_bus
     from jeepney.io.blocking import DBusConnection, open_dbus_connection
     _JEEPNEY_OK = True
@@ -90,7 +90,7 @@ def call(
     except Exception as exc:  # noqa: BLE001
         raise DBusError(f"{interface}.{method} send failed: {exc}") from exc
     if reply.header.message_type == MessageType.error:
-        err_name = reply.header.fields.get(4, "unknown-error")  # HeaderFields.error_name
+        err_name = reply.header.fields.get(HeaderFields.error_name, "unknown-error")
         err_text = ""
         if reply.body:
             err_text = str(reply.body[0])

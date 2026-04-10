@@ -6,7 +6,7 @@
 #   ./build.sh clean    # rm build/ and dist/ first
 #
 # Runtime requirements on the target Arch Linux machine:
-#   sudo pacman -S python-gobject layer-shell-qt xdg-desktop-portal-kde
+#   sudo pacman -S layer-shell-qt xdg-desktop-portal-kde
 #
 # The resulting binary is dist/flarereminder.
 
@@ -23,6 +23,11 @@ if [[ -d .venv ]]; then
     # shellcheck disable=SC1091
     source .venv/bin/activate
 fi
+
+# Ensure all Python dependencies are installed (dasbus -> jeepney migration
+# means deps may have changed since the last pip install).
+echo ">> pip install -r requirements.txt"
+pip install -q -r requirements.txt
 
 if ! command -v pyinstaller >/dev/null 2>&1; then
     echo "!! pyinstaller not found — installing into current environment"

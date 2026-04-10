@@ -4,16 +4,14 @@ PyQt6 doesn't natively expose the ``zwlr_layer_shell_v1`` protocol — its
 QPA always creates an ``xdg_toplevel`` for top-level windows. This module
 implements a best-effort hybrid:
 
-1. **LayerShellQt** (preferred): if KDE's ``layer-shell-qt`` is installed
-   the QPA plugin can be loaded via the ``QT_WAYLAND_SHELL_INTEGRATION``
-   environment variable *before* QApplication is constructed. We expose
-   ``maybe_enable_layer_shell_integration()`` for this purpose, called
-   from ``main.py`` ahead of QApplication. After QApplication is up we
-   try the ctypes interface to actually mark the window as
-   ``Layer::Overlay`` with anchors and exclusive zone.
-2. **KWin scripting fallback**: if (1) isn't available we install a
-   one-shot KWin JavaScript that finds windows by ``windowClass`` and
-   forces ``keepAbove``, ``skipTaskbar``, ``skipPager``, ``noBorder``.
+1. **LayerShellQt** (if user explicitly sets
+   ``QT_WAYLAND_SHELL_INTEGRATION=layer-shell``): we set ``layershell.*``
+   QSurface properties on the overlay window. **Note:** this env var
+   makes *every* Qt window in the process a layer-shell surface, which
+   can crash on hide/show cycles.  We do NOT set it automatically.
+2. **KWin scripting** (default path): we install a one-shot KWin
+   JavaScript that finds windows by ``windowClass`` and forces
+   ``keepAbove``, ``skipTaskbar``, ``skipPager``, ``noBorder``.
 3. **Final fallback**: trust ``Qt::WindowStaysOnTopHint`` only.
 
 All branches are wrapped in ``try/except`` and logged. The function
@@ -84,44 +82,59 @@ def _find_system_layer_shell_plugin() -> str | None:
 
 
 def maybe_enable_layer_shell_integration() -> bool:
-    """Hint Qt to use the layer-shell-qt QPA plugin, if available.
+    """Check whether layer-shell-qt is available and honour user overrides.
 
-    Must be called BEFORE constructing ``QApplication``. Returns True iff
-    the env var was set and Qt should actually be able to load the plugin.
+    Must be called BEFORE constructing ``QApplication``.
 
-    Handles both the "run from source" case (system PyQt6 picks up the
-    system plugin via the system plugin path) and the "frozen binary"
-    case (we must append the system plugin path to ``QT_PLUGIN_PATH`` so
-    Qt finds the layer-shell plugin alongside the bundled plugins).
+    **We intentionally do NOT set ``QT_WAYLAND_SHELL_INTEGRATION``
+    ourselves.**  Setting it globally makes *every* Qt window in the
+    process a layer-shell surface — including the settings dialog, file
+    pickers, and message boxes — which causes crashes when those windows
+    are hidden and re-shown ("already has a shell integration").
+
+    If the user has explicitly exported
+    ``QT_WAYLAND_SHELL_INTEGRATION=layer-shell`` before launching, we
+    honour it and make sure the system plugin path is reachable.
+    Otherwise we log the availability and return False; the overlay will
+    use the KWin-scripting strategy instead.
     """
-    if os.environ.get("QT_WAYLAND_SHELL_INTEGRATION"):
-        log.debug("QT_WAYLAND_SHELL_INTEGRATION already set; honoring it")
-        return True  # respect user override
-
+    user_override = os.environ.get("QT_WAYLAND_SHELL_INTEGRATION")
     system_plugin_dir = _find_system_layer_shell_plugin()
-    if system_plugin_dir is None:
-        log.debug(
-            "System layer-shell-qt plugin not found; running with default "
-            "Qt Wayland integration. Install the `layer-shell-qt` package "
-            "to get fullscreen-game stacking."
+
+    if user_override == "layer-shell":
+        # User explicitly asked for layer-shell.  Make sure the plugin
+        # is reachable from the (possibly frozen) binary.
+        if system_plugin_dir is not None:
+            existing = os.environ.get("QT_PLUGIN_PATH", "")
+            if system_plugin_dir not in existing.split(os.pathsep):
+                os.environ["QT_PLUGIN_PATH"] = (
+                    system_plugin_dir + (os.pathsep + existing if existing else "")
+                )
+                log.info("Prepended %s to QT_PLUGIN_PATH (user override)", system_plugin_dir)
+        log.info(
+            "QT_WAYLAND_SHELL_INTEGRATION=layer-shell set by user; "
+            "all windows will be layer-shell surfaces"
         )
+        return True
+
+    if user_override:
+        log.debug("QT_WAYLAND_SHELL_INTEGRATION=%s (user override)", user_override)
         return False
 
-    # Append the system Qt plugin path so Qt can actually load the
-    # layer-shell plugin when we're a PyInstaller frozen binary.
-    existing = os.environ.get("QT_PLUGIN_PATH", "")
-    if system_plugin_dir not in existing.split(os.pathsep):
-        os.environ["QT_PLUGIN_PATH"] = (
-            system_plugin_dir + (os.pathsep + existing if existing else "")
+    # Log availability for diagnostics, but do NOT set the env var.
+    if system_plugin_dir is not None:
+        log.info(
+            "layer-shell-qt plugin found at %s but NOT enabling globally "
+            "(would crash non-overlay windows). Using KWin scripting for "
+            "overlay stacking instead.",
+            system_plugin_dir,
         )
-        log.info("Prepended %s to QT_PLUGIN_PATH", system_plugin_dir)
-
-    os.environ["QT_WAYLAND_SHELL_INTEGRATION"] = "layer-shell"
-    log.info(
-        "Enabled QT_WAYLAND_SHELL_INTEGRATION=layer-shell (system plugin at %s)",
-        system_plugin_dir,
-    )
-    return True
+    else:
+        log.debug(
+            "layer-shell-qt plugin not found. Install the `layer-shell-qt` "
+            "package for best overlay stacking."
+        )
+    return False
 
 
 def apply_overlay_layer(qwindow: Any) -> str:
@@ -134,15 +147,16 @@ def apply_overlay_layer(qwindow: Any) -> str:
 
     Never raises.
     """
-    # Strategy 1: LayerShellQt via ctypes.
-    try:
-        if _try_layer_shell_qt(qwindow):
-            log.info("Overlay stacking strategy: layer-shell-qt")
-            return "layer-shell"
-    except Exception as exc:  # noqa: BLE001
-        log.warning("LayerShellQt path failed: %s", exc)
+    # Strategy 1: LayerShellQt — only if the user explicitly enabled it.
+    if os.environ.get("QT_WAYLAND_SHELL_INTEGRATION") == "layer-shell":
+        try:
+            if _try_layer_shell_qt(qwindow):
+                log.info("Overlay stacking strategy: layer-shell-qt")
+                return "layer-shell"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("LayerShellQt path failed: %s", exc)
 
-    # Strategy 2: KWin scripting via D-Bus.
+    # Strategy 2: KWin scripting via D-Bus (default path).
     try:
         if _try_kwin_keep_above_script():
             log.info("Overlay stacking strategy: kwin-script")
@@ -151,8 +165,8 @@ def apply_overlay_layer(qwindow: Any) -> str:
         log.warning("KWin scripting path failed: %s", exc)
 
     log.warning(
-        "No layer-shell or KWin scripting available; relying on "
-        "Qt::WindowStaysOnTopHint only. Fullscreen apps may cover the overlay."
+        "No KWin scripting available; relying on Qt::WindowStaysOnTopHint "
+        "only. Fullscreen apps may cover the overlay."
     )
     return "keep-above-only"
 
